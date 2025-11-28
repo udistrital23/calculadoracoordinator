@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -5,90 +6,125 @@ from pydantic import BaseModel
 import os
 import httpx
 
+# ===========================
+# CONFIGURAR LOGGING
+# ===========================
+logger = logging.getLogger("uvicorn")  # usa el logger de uvicorn
+logger.setLevel(logging.INFO)
+
+# ===========================
+# APP
+# ===========================
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
 
-# Microservice endpoint configuration (override via env vars)
-ADD_URL = os.getenv("ADD_SERVICE_URL", "http://add-service:8000/add")
-SUB_URL = os.getenv("SUB_SERVICE_URL", "http://sub-service:8000/sub")
-MUL_URL = os.getenv("MUL_SERVICE_URL", "http://mul-service:8000/mul")
-DIV_URL = os.getenv("DIV_SERVICE_URL", "http://div-service:8000/div")
-BAS_URL = os.getenv("DIV_SERVICE_URL", "http://div-service:8000/bas")
+# Microservices
+CONVERTER_URL = os.getenv("CONVERTER_URL", "https://udistrital23baseconverterservice-f9akbhb3ffffbfcy.eastus2-01.azurewebsites.net/converter")
+FORMATTER_URL = os.getenv("FORMATTER_URL", "https://udistrital23formatterservice-exbvc8gcdhandwc6.eastus2-01.azurewebsites.net/converter")
 
+OP_URLS = {
+    "add": os.getenv("ADD_URL", "https://udistrital23additionservice-b0bwfabmdsf3cyd3.eastus2-01.azurewebsites.net/suma"),
+    "sub": os.getenv("SUB_URL", "https://udistrital23substracionservice-eec5g6bge9btfgg0.eastus2-01.azurewebsites.net/resta"),
+    "mul": os.getenv("MUL_URL", "https://udistrital23multiplicationservice-htbeecdzd7grfud5.eastus2-01.azurewebsites.net/multiplicacion"),
+    "div": os.getenv("DIV_URL", "https://udistrital23divisionservice-d5c3drceguggccem.eastus2-01.azurewebsites.net/division"),
+}
 
 class CalcRequest(BaseModel):
     a: str
+    base_a: int
     b: str
-    base: int
+    base_b: int
     op: str
+    result_base: int
 
 
-def int_to_base(num: int, base: int) -> str:
-    digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    if base < 2 or base > len(digits):
-        raise ValueError("base must be between 2 and 36")
-    if num == 0:
-        return "0"
-    sign = "" if num >= 0 else "-"
-    num = abs(num)
-    out = ""
-    while num:
-        out = digits[num % base] + out
-        num //= base
-    return sign + out
+# ===========================
+# HELPER: CALL SERVICE
+# ===========================
+async def call_service(url: str, payload: dict):
+    logger.info(f"→ Enviando petición a {url} con payload: {payload}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, timeout=5.0)
+            logger.info(f"← Respuesta {resp.status_code} desde {url}: {resp.text}")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error(f"❌ Error llamando {url}: {e}")
+        raise
 
 
+# ===========================
+# ENDPOINTS
+# ===========================
 @app.get("/")
 async def index(request: Request):
+    logger.info("📄 Renderizando template.html")
     return templates.TemplateResponse("template.html", {"request": request})
 
 
 @app.post("/calculate")
 async def calculate(payload: CalcRequest):
+    logger.info(f"📥 Petición /calculate recibida: {payload}")
+
     op = payload.op.lower()
-    service_map = {
-        "add": ADD_URL,
-        "sum": ADD_URL,
-        "subtract": SUB_URL,
-        "sub": SUB_URL,
-        "mul": MUL_URL,
-        "multiply": MUL_URL,
-        "div": DIV_URL,
-        "divide": DIV_URL,
-    }
-    if op not in service_map:
-        raise HTTPException(status_code=400, detail="Unsupported operation")
+    if op not in OP_URLS:
+        logger.error(f"Operación no soportada: {op}")
+        raise HTTPException(400, "Operación no soportada")
 
-    url = service_map[op]
-    json_payload = {"a": payload.a, "b": payload.b, "base": payload.base}
+    # Convertir primer número
+    try:
+        logger.info("🔄 Convirtiendo primer número…")
+        conv_a = await call_service(CONVERTER_URL, {
+            "numero": payload.a,
+            "base": payload.base_a
+        })
+        a_int = conv_a["numero"]
+        logger.info(f"✔ Primer número convertido a int: {a_int}")
+    except Exception as e:
+        logger.error(f"Error convirtiendo primer número: {e}")
+        raise HTTPException(400, f"Error convirtiendo primer número: {e}")
 
-    # Try forwarding to microservice; on failure, perform local fallback
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(url, json=json_payload, timeout=5.0)
-            resp.raise_for_status()
-            # Expect microservice to return JSON like {"result": "..."}
-            return JSONResponse(content=resp.json())
-        except Exception:
-            # Fallback: do the calculation locally using integers
-            try:
-                a_int = int(payload.a, payload.base)
-                b_int = int(payload.b, payload.base)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid numbers for base {payload.base}: {e}")
+    # Convertir segundo número
+    try:
+        logger.info("🔄 Convirtiendo segundo número…")
+        conv_b = await call_service(CONVERTER_URL, {
+            "numero": payload.b,
+            "base": payload.base_b
+        })
+        b_int = conv_b["numero"]
+        logger.info(f"✔ Segundo número convertido a int: {b_int}")
+    except Exception as e:
+        logger.error(f"Error convirtiendo segundo número: {e}")
+        raise HTTPException(400, f"Error convirtiendo segundo número: {e}")
 
-            if op in ("add", "sum"):
-                res = a_int + b_int
-            elif op in ("subtract", "sub"):
-                res = a_int - b_int
-            elif op in ("mul", "multiply"):
-                res = a_int * b_int
-            elif op in ("div", "divide"):
-                if b_int == 0:
-                    raise HTTPException(status_code=400, detail="Division by zero")
-                # Integer division; microservice semantics may differ
-                res = a_int // b_int
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported operation")
+    # Operación
+    try:
+        logger.info(f"🧮 Realizando operación: {op}")
+        op_result = await call_service(OP_URLS[op], {
+            "numero_a": a_int,
+            "numero_b": b_int
+        })
+        raw_result = op_result["resultado"]
+        logger.info(f"✔ Resultado operación: {raw_result}")
+    except Exception as e:
+        logger.error(f"Error en operación: {e}")
+        raise HTTPException(400, f"Error en operación: {e}")
 
-            return {"result": int_to_base(res, payload.base)}
+    # Formateo final
+    try:
+        logger.info(f"🔢 Formateando resultado en base {payload.result_base}")
+        fmt = await call_service(FORMATTER_URL, {
+            "numero": raw_result,
+            "base_origen" : 10,
+            "base_destino": payload.result_base
+        })
+        formatted = fmt["numero"]
+        logger.info(f"✔ Resultado final formateado: {formatted}")
+    except Exception as e:
+        logger.error(f"Error formateando resultado: {e}")
+        raise HTTPException(400, f"Error formateando resultado: {e}")
+
+    logger.info(f"📤 Enviando resultado final: {formatted}")
+    return {"result": formatted}
